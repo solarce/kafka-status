@@ -141,11 +141,13 @@ kafka_topics.each do | topic, topic_data |
   puts "\s\s\s\sTopic: #{topic}"
   puts "\s\s\s\s\s\sReplication Factor: #{topic_data['config']['ReplicationFactor']}"
   puts "\s\s\s\s\s\sPartition Count: #{topic_data['config']['PartitionCount']}"
+  #TODO: add more info about which broker is the leader and which brokers are ISRs
   # partition counts in kafka are zero based
   i = (topic_data["config"]["PartitionCount"].to_i - 1)
   while i >= 0
-    if topic_data["partitions"]["partition_#{i}"]["NumberOfReplicas"].to_i == topic_data["config"]["ReplicationFactor"].to_i
-    #puts "zomg"
+    if topic_data["partitions"]["partition_#{i}"]["NumberOfReplicas"].to_i != topic_data["config"]["ReplicationFactor"].to_i
+    puts "partition_#{i} does not have a sufficient number of replicas"
+    #TODO: add more logic here to show which brokers have a replica
     end
     i = i - 1
   end
