@@ -19,17 +19,9 @@ kafka_cluster_hosts = {}
 zookeeper_cluster_hosts = []
 
 # find out what zookeeper cluster this kafka broker uses
-zookeeper_cluster_hosts = %x(grep zookeeper.connect #{kafka_conf} | cut -d '=' -f 2).split(",")
-zookeeper_host = zookeeper_cluster_hosts[0]
-zk = ZK.new(zookeeper_host)
-
-# test that we're able to successfully connect to zookeeper
-if zk.state.to_s != "connected"
-  puts "Failed to connect to: #{zookeeper_host}"
-  exit(1)
-else
-  #puts "Connected to : #{zookeeper_host}"
-end
+zookeeper_cluster_hosts = File.read(kafka_conf).split("\n").grep(/zookeeper\.connect/)[0].split('=')[1]
+zk = ZK.new(zookeeper_cluster_hosts)
+zk.wait_until_connected(30)
 
 # get a list of broker ids from zookeeper
 kafka_broker_ids = zk.children("/brokers/ids")
@@ -38,7 +30,6 @@ kafka_broker_ids = zk.children("/brokers/ids")
 kafka_brokers = {}
 
 kafka_broker_ids.each do | broker_id |
-  kafka_broker_details = {}
 
   # get details about broker in JSON and turn into a hash
   kafka_broker = zk.get("/brokers/ids/#{broker_id}")[0]
@@ -47,18 +38,20 @@ kafka_broker_ids.each do | broker_id |
   # set kafka_broker_host to short hostname
   kafka_broker_host = kafka_broker["host"].split(".")[0]
 
-  # populate kafka_broker_details with what we've learned about the broker
-  kafka_broker_details["hostname"] = kafka_broker["host"]
-  kafka_broker_details["ip_address"] = %x(host #{kafka_broker["host"]} | cut -d ' ' -f 4)
-  kafka_broker_details["broker_id"] = broker_id
-  kafka_brokers["#{kafka_broker_host}"] = kafka_broker_details
+  # populate kafka_brokers with what we've learned about the broker
+  kafka_brokers[kafka_broker_host] = {
+    "hostname" => kafka_broker["host"],
+    "broker_id" => broker_id,
+    "ip_address" => IPSocket.getaddress(kafka_broker['host'])
+  }
+
 end
 
 # where you find kafka-topics.sh
 kafka_topics_bin = "#{kafka_bin}/kafka-topics.sh"
 
 # get a list of topics in this kafka cluster
-kafka_topic_names = %x(#{kafka_topics_bin} --list --zookeeper #{zookeeper_host}).split("\n")
+kafka_topic_names = %x(#{kafka_topics_bin} --list --zookeeper #{zookeeper_cluster_hosts}).split("\n")
 
 # get details on each kafka topic and build a hash map of it
 kafka_topics = {}
@@ -68,7 +61,7 @@ kafka_topic_names.each do | topic |
   topic_details = {}
 
   # describe the details of the topic
-  data_topic = %x(#{kafka_topics_bin} --describe --zookeeper #{zookeeper_host} --topic #{topic})
+  data_topic = %x(#{kafka_topics_bin} --describe --zookeeper #{zookeeper_cluster_hosts} --topic #{topic})
 
   # we get back the details as a string, let's split the string into an array by newline character
   data_topic = data_topic.split("\n")
@@ -79,51 +72,49 @@ kafka_topic_names.each do | topic |
   data_topic_config = data_topic[0].split("\t")
   data_topic_config.delete("Configs:")
   data_topic_config.each do | data |
-    data = data.split(":")
-    topic_configs["#{data[0]}"] = data[1].strip
+    key, value = data.split(":")
+    topic_configs[key] = value.strip
   end
 
   # remove configs from array so we can process partition information
-  data_topic.delete_at(0)
+  data_topic.shift
 
   # process partition information
   topic_partitions = {}
 
   # what's left in data_topic is at least one element about partitions
   # so we'll cycle through however many partitions are there and grab their info
-  i = 0
-  while data_topic.length() > 0
+  data_topic.each do | data_partition |
     topic_partition_details = {}
 
-    # split by tab characters and delete the first element, which just contains
-    # the topic name
-    data_partition = data_topic[0].split("\t")
-    data_partition.delete_at(0)
+    # the data is tab character separated, so we'll split it up in an array
+    data_partition = data_partition.split("\t")
+
+    # since there is a leading tab character we can get rid of the first element
+    data_partition.shift
 
     data_partition.each do | data |
-      data = data.split(":")
+      key, value = data.split(":")
       # determine the number of replicas the partition has
-      if data[0] == "Replicas"
+      if key == "Replicas"
         # turn this into an array to so we can get its length
-        replicas = data[1].strip.split(",")
+        replicas = value.strip.split(",")
         topic_partition_details["NumberOfReplicas"] = replicas.length
       else
-        topic_partition_details["#{data[0]}"] = data[1].strip
+        topic_partition_details[key] = value.strip
       end
     end
 
     # we want to store the data about each topic by the topic numeric id
-    topic_partitions["partition_#{i.to_s}"] = topic_partition_details
+    partition_numeric_id = topic_partition_details["Partition"]
+    topic_partitions["partition_#{partition_numeric_id}"] = topic_partition_details
 
-    # remove this element since we're done with it and increment for the next pass
-    data_topic.delete_at(0)
-    i = i + 1
   end
 
   # we now have topic_configs and partition info
   topic_details["config"] = topic_configs
   topic_details["partitions"] = topic_partitions
-  kafka_topics["#{topic}"] = topic_details
+  kafka_topics[topic] = topic_details
 end
 
 # show status
@@ -143,13 +134,11 @@ kafka_topics.each do | topic, topic_data |
   puts "\s\s\s\s\s\sPartition Count: #{topic_data['config']['PartitionCount']}"
   #TODO: add more info about which broker is the leader and which brokers are ISRs
   # partition counts in kafka are zero based
-  i = (topic_data["config"]["PartitionCount"].to_i - 1)
-  while i >= 0
+  topic_data["config"]["PartitionCount"].to_i.times do |i|
     if topic_data["partitions"]["partition_#{i}"]["NumberOfReplicas"].to_i != topic_data["config"]["ReplicationFactor"].to_i
     puts "partition_#{i} does not have a sufficient number of replicas"
     #TODO: add more logic here to show which brokers have a replica
     end
-    i = i - 1
   end
 
 end
